@@ -40,6 +40,7 @@ public:
     String  micE;
     bool    gpsEcoMode;
     String  profileLabel;
+    String  key;
 };
 
 class Display {

@@ -186,6 +186,7 @@ void loop() {
             currentBeacon = &Config.beacons[myBeaconsIndex];
         }
         miceActive = Config.validateMicE(currentBeacon->micE);
+        LoRa_Utils::getBeaconKey();
     }
 
     SMARTBEACON_Utils::checkSettings(currentBeacon->smartBeaconSetting);

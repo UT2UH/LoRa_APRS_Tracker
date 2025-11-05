@@ -19,6 +19,7 @@
 #include <RadioLib.h>
 #include <logger.h>
 #include <SPI.h>
+#include <mbedtls/aes.h>
 #include "notification_utils.h"
 #include "configuration.h"
 #include "board_pinout.h"
@@ -27,10 +28,20 @@
 
 extern logging::Logger  logger;
 extern Configuration    Config;
+extern Beacon           *currentBeacon;
+extern uint8_t          myBeaconsIndex;
 extern LoraType         *currentLoRaType;
 extern uint8_t          loraIndex;
 extern int              loraIndexSize;
 
+mbedtls_aes_context     aes;
+CryptoKey               key = {};
+// Our per packet nonce
+uint8_t                 nonce[16] = {0};
+// Time dependant nonce to En/Decrypt LoRa packets
+time_t                  beaconNonce;
+uint8_t                 lorabuf[364];
+uint8_t                 rxbuffer[300], rxmsg[300];
 bool operationDone   = true;
 bool transmitFlag    = true;
 
@@ -56,6 +67,30 @@ bool transmitFlag    = true;
 #endif
 
 namespace LoRa_Utils {
+
+    void getBeaconKey(){
+        // load encryption key
+        key.length = Config.beacons[myBeaconsIndex].key.length(); //abcd efgh ijkl mnop
+        Serial.print("Key: "); Serial.print(Config.beacons[myBeaconsIndex].key);
+        Serial.print(" Key len: "); Serial.println(key.length);
+        if(key.length >= 32)
+            key.length = 32;
+        else if (key.length >= 16)
+            key.length = 16;
+        else
+            key.length = 0;
+        memset(key.bytes, 0, sizeof(key.bytes));
+        strncpy((char*)key.bytes, Config.beacons[myBeaconsIndex].key.c_str(), key.length );
+        LoRa_Utils::setKey(key);
+        //
+        // Serial.println("Key: ");
+        // for(uint8_t i=0; i < key.length; i++){
+        //     char hexChar[2];
+        //     sprintf(hexChar, "%02X", key.bytes[i]);
+        //     Serial.print(hexChar);
+        // }
+        // Serial.print(" Key len: "); Serial.println(key.length);
+    }
 
     void setFlag(void) {
         operationDone = true;
@@ -183,8 +218,12 @@ namespace LoRa_Utils {
         }
         if (Config.notification.ledTx) digitalWrite(Config.notification.ledTxPin, HIGH);
         if (Config.notification.buzzerActive && Config.notification.txBeep) NOTIFICATION_Utils::beaconTxBeep();
-        
-        int state = radio.transmit("\x3c\xff\x01" + newPacket);
+
+        String loraPacket = "\x3c\xff\x01" + newPacket;
+        size_t loraPacketLen = loraPacket.length();
+        strncpy((char*)lorabuf, loraPacket.c_str(), loraPacketLen);
+        _encrypt(beaconNonce, lorabuf, loraPacketLen);
+        int state = radio.startTransmit(lorabuf, loraPacketLen);
         transmitFlag = true;
         if (state == RADIOLIB_ERR_NONE) {
             //Serial.println(F("success!"));
@@ -206,10 +245,12 @@ namespace LoRa_Utils {
 
     ReceivedLoRaPacket receiveFromSleep() {
         ReceivedLoRaPacket receivedLoraPacket;
-        String packet = "";
-        int state = radio.readData(packet);
+        size_t rxPacketLen = radio.getPacketLength();
+        int state = radio.readData(rxbuffer, rxPacketLen);
+        memcpy(rxmsg, rxbuffer, rxPacketLen);
+        _decrypt(beaconNonce, rxmsg, rxPacketLen);
         if (state == RADIOLIB_ERR_NONE) {
-            receivedLoraPacket.text       = packet;
+            receivedLoraPacket.text       = String(rxmsg, rxPacketLen);
             receivedLoraPacket.rssi       = radio.getRSSI();
             receivedLoraPacket.snr        = radio.getSNR();
             receivedLoraPacket.freqError  = radio.getFrequencyError();
@@ -228,11 +269,14 @@ namespace LoRa_Utils {
                 radio.startReceive();
                 transmitFlag = false;
             } else {
-                int state = radio.readData(packet);
+                size_t rxPacketLen = radio.getPacketLength();
+                int state = radio.readData(rxbuffer, rxPacketLen);
+                memcpy(rxmsg, rxbuffer, rxPacketLen);
+                _decrypt(beaconNonce, rxmsg, rxPacketLen);
                 if (state == RADIOLIB_ERR_NONE) {
                     if(!packet.isEmpty()) {
                         logger.log(logging::LoggerLevel::LOGGER_LEVEL_INFO, "LoRa Rx","---> %s", packet.substring(3).c_str());
-                        receivedLoraPacket.text       = packet;
+                        receivedLoraPacket.text       = String(rxmsg, rxPacketLen);
                         receivedLoraPacket.rssi       = radio.getRSSI();
                         receivedLoraPacket.snr        = radio.getSNR();
                         receivedLoraPacket.freqError  = radio.getFrequencyError();
@@ -248,6 +292,65 @@ namespace LoRa_Utils {
 
     void sleepRadio() {
         radio.sleep();
+    }
+
+    /**
+     * Set the key used for _encrypt, _decrypt.
+     *
+     * As a special case: If all bytes are zero, we assume _no encryption_ and send all data in cleartext.
+     *
+     * @param numBytes must be 16 (AES128), 32 (AES256) or 0 (no crypt)
+     * @param bytes a _static_ buffer that will remain valid for the life of this crypto instance (i.e. this class will cache the
+     * provided pointer)
+     */
+    void setKey(const CryptoKey &k) {
+        //Serial.printlog("Using AES%d key!\n", k.length * 8);
+        key = k;
+        if (key.length != 0) {
+            auto res = mbedtls_aes_setkey_enc(&aes, key.bytes, key.length * 8);
+        }
+    }
+
+    /**
+     * Encrypt a packet
+     *
+     * @param bytes is updated in place
+     */
+    void _encrypt(uint32_t timeNonce, uint8_t *bytes, size_t numBytes) {
+        if (key.length > 0) {
+            // initNonce(timeNonce); in LSB
+            memset(nonce, 0, sizeof(nonce));
+            // use memcpy to avoid breaking strict-aliasing
+            memcpy(nonce, &timeNonce, sizeof(uint32_t));
+            // for(uint8_t i = 0; i < numBytes; i++){
+            //     Serial.print(bytes[i], HEX);
+            //     Serial.print(" ");
+            // }
+            // Serial.println();
+            if (numBytes <= MAX_BLOCKSIZE) {
+                static uint8_t scratch[MAX_BLOCKSIZE];
+                uint8_t stream_block[16];
+                size_t nc_off = 0;
+                memcpy(scratch, bytes, numBytes);
+                memset(scratch + numBytes, 0,
+                        sizeof(scratch) - numBytes); // Fill rest of buffer with zero (in case cypher looks at it)
+
+                auto res = mbedtls_aes_crypt_ctr(&aes, numBytes, &nc_off, nonce, stream_block, scratch, bytes);
+                assert(!res);
+            } else {
+                //Serial.printlog("Packet too large for crypto engine: %d. noop encryption!\n", numBytes);
+            }
+        }
+        // for(uint8_t i = 0; i < numBytes; i++){
+        //     Serial.print(bytes[i], HEX);
+        //     Serial.print(" ");
+        // }
+        // Serial.println();
+    }
+
+    void _decrypt(uint32_t timeNonce, uint8_t *bytes, size_t numBytes) {
+        // For CTR, the implementation is the same
+        _encrypt(timeNonce, bytes, numBytes);
     }
 
 }

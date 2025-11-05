@@ -21,6 +21,14 @@
 
 #include <Arduino.h>
 
+#define MAX_BLOCKSIZE 256
+
+struct CryptoKey {
+    uint8_t bytes[32];
+    /// # of bytes, or -1 to mean "invalid key - do not use"
+    int8_t length;
+};
+
 struct ReceivedLoRaPacket {
     String  text;
     int     rssi;
@@ -38,6 +46,10 @@ namespace LoRa_Utils {
     ReceivedLoRaPacket receiveFromSleep();
     ReceivedLoRaPacket receivePacket();
     void sleepRadio();
+    void    setKey                      (const CryptoKey &k);
+    void    getBeaconKey                ();
+    void    _encrypt                    (uint32_t timeNonce, uint8_t *bytes, size_t numBytes);
+    void    _decrypt                    (uint32_t timeNonce, uint8_t *bytes, size_t numBytes);
 
 }
 
