@@ -150,6 +150,15 @@ function loadSettings(settings) {
                      id="beacons.${index}.profileLabel" 
                      value="${beacons.profileLabel}">
                  <label for="beacons.${index}.profileLabel">Profile Label</label>
+            </div>
+            <div class="form-floating col-12 col-md-9 px-1 mb-2" style="margin-left: 50px;">
+                 <input 
+                     type="text" 
+                     class="form-control form-control-sm" 
+                     name="beacons.${index}.key" 
+                     id="beacons.${index}.key" 
+                     value="${beacons.key}">
+                 <label for="beacons.${index}.key">Encryption Key</label>
              </div>
         `;
         beaconContainer.appendChild(beaconElement);
